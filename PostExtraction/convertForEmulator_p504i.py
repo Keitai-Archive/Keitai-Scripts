@@ -12,7 +12,7 @@ import traceback
 def main():
     java_directory = sys.argv[1]
 
-    output_folder = os.path.dirname(java_directory) + "\\output\\"
+    output_folder = os.path.join(os.getcwd(), "output")
     os.makedirs(output_folder, exist_ok=True)
     
     adf_dir = os.path.join(java_directory, "JAM")
