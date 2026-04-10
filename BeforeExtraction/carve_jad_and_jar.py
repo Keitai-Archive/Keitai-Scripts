@@ -18,18 +18,41 @@ utf8_pattern = re.compile(
     rb')+'
 )
 
-def find_jad_offset(dump_data, appname_off):
-    min_search = max(appname_off-0x4000, 0)
-    max_search = min(appname_off+0x4000, len(dump_data))
-    utf8_matches = utf8_pattern.finditer(dump_data[min_search:max_search])
+def carve_jad(dump_data, appname_off):
+    range_min = max(appname_off-0x4000, 0)
+    range_max = min(appname_off+0x4000, len(dump_data))
+    utf8_matches = utf8_pattern.finditer(dump_data[range_min : range_max])
 
     for m in utf8_matches:
-        min_off = m.start() + min_search
-        max_off = m.end() + min_search
+        min_off = range_min + m.start()
+        max_off = range_min + m.end()
         if min_off <= appname_off < max_off:
-            return (min_off, max_off)
+            break
+        
+    jad_data = dump_data[min_off : max_off]
+    if jad_data.find(b"MIDlet-Jar-URL:") == -1 or jad_data.find(b"MIDlet-Jar-Size:") == -1:
+        raise Exception("The required keys for JAD are missing.")
+
+    jad_str = jad_data.decode("utf-8")
+
+    # Delete invalid lines
+    filtered = []
+    is_valid = False
+    for l in jad_str.splitlines(keepends=True):
+        if not is_valid and ":" not in l:
+            continue
+        else:
+            is_valid = True
+            
+        if is_valid and ":" in l:
+            filtered.append(l)
+        else:
+            break
+            
+    jad_str = "".join(filtered)
+
+    return (min_off, max_off, jad_str)
     
-    raise Exception()
 
 
 def extract_jar_name(url_str):
@@ -76,23 +99,10 @@ def carve_jad_and_jar(dump_data, output_dir):
     while True:
         # JAD part
         appname_off = dump_data.find(b"MIDlet-Name:", appname_off+1)
-        
         if appname_off == -1:
             break
 
-        (jad_start, jad_end) = find_jad_offset(dump_data, appname_off)
-        
-        # Avoid the case where the JAR signature "PK" is included at the end.
-        pkoff = dump_data.find(b"PK\x03\x04", jad_start, jad_end+2)
-        if pkoff != -1 and pkoff < jad_end:
-            jad_end = pkoff
-        
-        jad_content = dump_data[jad_start:jad_end]
-        if jad_content.find(b"MIDlet-Jar-URL:") == -1 or jad_content.find(b"MIDlet-Jar-Size:") == -1:
-            continue
-
-        #print(hex(jad_start), hex(jad_end), jad_content)
-        jad_str = jad_content.decode("utf-8")
+        jad_start, jad_end, jad_str = carve_jad(dump_data, appname_off)
 
         try:
             app_name = re.search(r"MIDlet-Name:\x20?([^\r\n]+)" ,jad_str)[1]
@@ -104,17 +114,17 @@ def carve_jad_and_jar(dump_data, output_dir):
             continue
         
         # JAR part
-        jar_start = dump_data.find(b"PK\x03\x04", jad_end, jad_end+0x2000)
+        jar_start = dump_data.find(b"PK\x03\x04", jad_start, jad_start+0x2000)
         if jar_start == -1:
             print("WAMN: jar not found.")
             continue
         jar_end = jar_start + jar_size
         print(f"found {file_name}.jar (start: {hex(jar_start)}, size: {jar_size} bytes)")
         
-        jar_content = dump_data[jar_start:jar_end]
+        jar_data = dump_data[jar_start : jar_end]
 
         try:
-            verify_jar(jar_content)
+            verify_jar(jar_data)
         except JarValidationError as e:
             print(f"WARN: {str(e)}")
             file_name = file_name + " (corrupted)"
@@ -129,7 +139,7 @@ def carve_jad_and_jar(dump_data, output_dir):
                 i += 1
         
         with open(os.path.join(output_dir, out_name + ".jad"), "wb") as jad_f:
-            jad_f.write(jad_content)
+            jad_f.write(jad_str.encode("utf-8"))
 
         with open(os.path.join(output_dir, out_name + ".jar"), "wb") as jar_f:
             jar_f.write(dump_data[jar_start:jar_end])
