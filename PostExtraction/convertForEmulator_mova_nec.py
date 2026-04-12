@@ -13,6 +13,8 @@ class SpType(Enum):
     SINGLE = auto()
     MULTI = auto()
 
+DEBUG = False
+
 CONFIGS = {
     "N504iS": {
         "device_name": "N504iS",
@@ -44,77 +46,122 @@ CONFIGS = {
     },
 }
 
+class DirType(Enum):
+    SSR200 = auto()
+    M4 = auto()
+
+def detect_dirtype(dir_path):
+    if all(os.path.isdir(os.path.join(dir_path, n)) for n in ["ADF", "JAR", "SCP"]):
+        return DirType.SSR200
+    
+    if any(f.startswith("region_") for f in os.listdir(dir_path) if os.path.isfile(os.path.join(dir_path, f))):
+        return DirType.M4
+    
+    raise ValueError("unknown dir type")
+
+
 def main(model_config, input_dir, output_dir):
     os.makedirs(output_dir, exist_ok=True)
 
-    region_files = [file for file in os.listdir(input_dir) if os.path.isfile(os.path.join(input_dir, file)) and file.startswith("region_")]
-    region_files.sort()
+    app_path_conbos = []
 
-    app_file_sets = []
+    dirtype = detect_dirtype(input_dir)
+    print("dir type:", dirtype)
 
-    app_file_set = {
-        "jar": None,
-        "sp": None,
-        "adf": None
-    }
+    if dirtype == DirType.M4:
+        region_files = [file for file in os.listdir(input_dir) if os.path.isfile(os.path.join(input_dir, file)) and file.startswith("region_")]
+        region_files.sort()
 
-    for region_file in region_files:
-        with open(os.path.join(input_dir, region_file), "rb") as inf:
-            region_data = inf.read()
-
+        app_path_conbo = {
+            "jar": None,
+            "sp": None,
+            "adf": None,
+        }
         # order: JAR [SP] ADF
-        if app_file_set["jar"] is None and region_data[:4] == b"PK\x03\x04":
-            app_file_set["jar"] = region_file
-        elif app_file_set["jar"] is not None and app_file_set["sp"] is None:
-            try:
-                (adf_dict, _, _) = perse_adf(region_data, model_config["start_adf"], model_config["draw_area"], model_config["device_name"])
+        for region_file in region_files:
+            region_path = os.path.join(input_dir, region_file)
+            with open(region_path, "rb") as inf:
+                region_data = inf.read()
 
-                if not all(key in adf_dict for key in ["AppName", "PackageURL", "AppClass", "LastModified"]):
-                    raise Exception("Missing required value.")
-                
-                app_file_set["adf"] = region_file
-            except Exception as e:
-                app_file_set["sp"] = region_file
-                #print(region_file, e)
-        elif app_file_set["jar"] is not None and app_file_set["sp"] is not None:
-            app_file_set["adf"] = region_file
-        
-        if app_file_set["adf"] is not None:
-            app_file_sets.append(copy.deepcopy(app_file_set))
+            if app_path_conbo["jar"] is None and region_data[:4] == b"PK\x03\x04":
+                app_path_conbo["jar"] = region_path
+            elif app_path_conbo["jar"] is not None and app_path_conbo["sp"] is None:
+                try:
+                    (adf_dict, _, _) = perse_adf(region_data, model_config["start_adf"])
 
-            app_file_set = {
+                    #print(adf_dict)
+                    if not all(key in adf_dict for key in ["AppName", "PackageURL", "AppClass", "LastModified"]):
+                        raise Exception("Missing required value.")
+                    if not adf_dict["PackageURL"].startswith("http://"):
+                        raise Exception("PackageURL is not URL")
+                    
+                    app_path_conbo["adf"] = region_path
+                except Exception as e:
+                    app_path_conbo["sp"] = region_path
+                    #print(region_file, e)
+            elif app_path_conbo["jar"] is not None and app_path_conbo["sp"] is not None:
+                app_path_conbo["adf"] = region_path
+            
+            if app_path_conbo["adf"] is not None:
+                app_path_conbos.append(copy.deepcopy(app_path_conbo))
+                app_path_conbo = {
+                    "jar": None,
+                    "sp": None,
+                    "adf": None,
+                }
+
+    elif dirtype == DirType.SSR200:
+        adf_dir = os.path.join(input_dir, "ADF")
+        jar_dir = os.path.join(input_dir, "JAR")
+        scp_dir = os.path.join(input_dir, "SCP")
+
+        for adfname in [f for f in os.listdir(adf_dir) if os.path.join(adf_dir, f)]:
+            app_path_conbo = {
                 "jar": None,
                 "sp": None,
-                "adf": None
+                "adf": None,
             }
+            basename = os.path.splitext(adfname)[0]
+            app_path_conbo["adf"] = os.path.join(adf_dir, adfname)
 
-    for app_file_set in app_file_sets:
-        jar_filename = app_file_set["jar"]
-        sp_filename = app_file_set.get("sp")
-        adf_filename = app_file_set["adf"]
+            jar_candidate = os.path.join(jar_dir, basename + ".jar")
+            if os.path.isfile(jar_candidate):
+                app_path_conbo["jar"] = jar_candidate
+            else:
+                continue
 
-        print(f"\n[{jar_filename}]")
-        print(f"JAR: {jar_filename}")
-        print(f"SP: {sp_filename}")
-        print(f"ADF: {adf_filename}")
+            sp_candidate = os.path.join(scp_dir, basename + ".scp")
+            if os.path.isfile(sp_candidate):
+                app_path_conbo["sp"] = sp_candidate
+
+            app_path_conbos.append(copy.deepcopy(app_path_conbo))
+
+    else:
+        raise ValueError(dirtype)
+
+
+    for app_path_conbo in app_path_conbos:
+        jar_path = app_path_conbo["jar"]
+        sp_path = app_path_conbo["sp"]
+        adf_path = app_path_conbo["adf"]
+
+        print(f"\n[{os.path.basename(adf_path)}]")
+        print(f"ADF: {adf_path}")
+        print(f"JAR: {jar_path}")
+        print(f"SP: {sp_path}")
         
         try:
-            jar_file_path = os.path.join(input_dir, jar_filename)
-            adf_file_path = os.path.join(input_dir, adf_filename)
-
-            if sp_filename is None:
-                print(f"WARN: No SP file found for {jar_filename}")
+            if sp_path is None:
+                print(f"WARN: No SP file found for {os.path.basename(adf_path)}")
                 sp_data = b""
             else:
-                sp_file_path = os.path.join(input_dir, sp_filename)
-
-                with open(sp_file_path, "rb") as file:
+                with open(sp_path, "rb") as file:
                     sp_data = file.read()
 
-            with open(jar_file_path, "rb") as file:
+            with open(jar_path, "rb") as file:
                 jar_data = file.read()
 
-            with open(adf_file_path, "rb") as file:
+            with open(adf_path, "rb") as file:
                 adf_data = file.read()
 
             jar_size = len(jar_data)
@@ -134,13 +181,13 @@ def main(model_config, input_dir, output_dir):
             with open(out_jam_file_path, 'wb') as adf_file:
                 adf_file.write(out_adf_data)
 
-            shutil.copy(jar_file_path, out_jar_file_path)
+            shutil.copy(jar_path, out_jar_file_path)
 
-            if sp_filename is not None:
+            if sp_path is not None:
                 with open(out_sp_file_path, 'wb') as sp_file:
                     sp_file.write(out_sp_data)
 
-            print(f"Successfully processed! => {jar_name}")
+            print(f"Output file name: {jar_name}")
         except Exception as e:
             traceback.print_exc()
     print(f"\nAll done! => {output_dir}")
@@ -158,18 +205,26 @@ def convert(adf_data, sp_data, jar_size, model_config):
             sp_sizes = read_spsizes_from_adf(adf_data, start_spsize)
         elif sp_type == SpType.SINGLE:
             sp_sizes = [struct.unpack('<I', adf_data[start_spsize:start_spsize + 4])[0]]
-            if sp_sizes[0] == 0: sp_sizes = []
+            if sp_sizes[0] == 0:
+                sp_sizes = []
         else:
             raise Exception("no sp_type input")
     except struct.error:
         print("Failed: bronken ADF file.")
         return
 
-    (adf_dict, jam_download_url, other_items) = perse_adf(adf_data, start_adf, draw_area, device_name)
-    print(f"{adf_dict=}, {jam_download_url=}, {other_items=}")
+    (adf_dict, jam_download_url, other_items) = perse_adf(adf_data, start_adf)
+    print(f"ADF Values: {adf_dict}")
+    if other_items:
+        print(f"❗ JAM unused values: {other_items} ❗")
+    print(f"JAM Download URL: {jam_download_url}")
 
     if len(sp_sizes) != 0 and sum(sp_sizes) != len(sp_data):
         print("WARN: Mismatch between spsize and actual size.")
+
+    if not "DrawArea" in adf_dict:
+        print("INFO: Since the ADF does not have a 'DrawArea' value, the device canvas size is used instead.")
+        adf_dict["DrawArea"] = draw_area
 
     # Re-format LastModified
     adf_dict["LastModified"] = email.utils.parsedate_to_datetime(adf_dict["LastModified"])
@@ -218,57 +273,99 @@ def read_spsizes_from_adf(adf_data, start_offset):
     return integers
 
 
-def perse_adf(adf_data, start_adf, draw_area, device_name):
+def perse_adf(adf_data, start_adf):
     adf_dict = {}
 
-    # Parse adf. order: AppName [AppVer] PackageURL [ConfigurationVer] AppClass [AppParam] LastModified [TargetDevice] [ProfileVer] jar_download_url
-    adf_items = filter(None, adf_data[start_adf:].split(b"\00"))
-    adf_items = list(map(lambda b: b.decode("cp932", errors="replace"), adf_items))
-
-    adf_dict["AppName"] = adf_items[0]
-
-    if not adf_items[1].startswith("http"):
-        adf_dict["AppVer"] = adf_items[1]
-    else:
-        adf_items.insert(1, None)
-
-    adf_dict["PackageURL"] = adf_items[2]
+    # Unknown:
+    # UseNetwork http
+    # UseTelephone call
+    # UseBrowser launch
+    # UseDTV launch
+    # AppTrace "on"
+    # DrawArea
+    # MyConcierge yes
+    # GetSysInfo yes
+    # LaunchApp yes
+    # RemoteControl yes
+    # AccessUserInfo yes
+    # GetUtn terminalid or userid
+    # LaunchByApp deny
+    # IletPreserve deny
+    # LaunchByBML 0-11
+    # MessageCode 10digits ascii
+    # UseStorage ext
     
-    if adf_items[3] in ["CLDC-1.1", "CLDC-1.0"]:
-        adf_dict["ConfigurationVer"] = adf_items[3]
-    else:
-        adf_items.insert(3, None)
+    key_map_sys = {
+        0x00: "jarsize_to_adf_area_size", # 0x60
+        0x3A: "padding_size", # 0x20
+        0x4F: "sp_area_size", # 0x40
+        
+    }
+    
+    key_map_first = {
+        0x04: "AppName",
+        0x05: "AppVer",
+        0x10: "LaunchAt",
+        0x06: "PackageURL",
+        # ? : "ConfigurationVer",
+        0x0A: "AppClass",
+        0x0C: "AppParam",
+        0x0E: "LastModified",
+        # The order might be wrong.
+        0x0F: "TargetDevice",
+        0x16: "AllowPushBy",
+        0x12: "LaunchByMail",
+        0x14: "LaunchByBrowser",
+        0x08: "ProfileVer",
+        0x02: "jam_download_url",
+    }
+    
+    key_map_second = {
+        0x3B: "TrustedAPID",
+        0x40: "unknownjarurl",
+        0x43: "TrustedLmd",
+        #0x38: "unknown",
+        0x50: "LaunchByMail",
+    }
+    
+    len_dict_sys = {}
+    for off, key in key_map_sys.items():
+        len_dict_sys[key] = adf_data[off]
 
-    adf_dict["AppClass"] = adf_items[4]
-
-    if not adf_items[5].startswith(("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")):
-        adf_dict["AppParam"] = adf_items[5]
-    else:
-        adf_items.insert(5, None)
-
-    adf_dict["LastModified"] = adf_items[6]
-
-    other_items = []
-    if len(adf_items) > 6:
-        for adf_item in adf_items[7:]:
-            if re.search(r"(SH|SO|F|D|N|P)\d{3}", adf_item):
-                adf_dict["TargetDevice"] = adf_item
-            elif adf_item.startswith(("DoJa-1.0", "DoJa-2.0", "DoJa-2.1", "DoJa-2.2", "DoJa-3.0", "DoJa-3.5", "DoJa-4.0", "DoJa-4.1", "DoJa-5.0", "DoJa-5.1")):
-                adf_dict["ProfileVer"] = adf_item
-            elif adf_item.startswith("http"):
-                jam_download_url = adf_item
-            elif adf_item.endswith(".gif"):
-                adf_dict["AppIcon"] = adf_item
-            elif m := re.search(r"\d{3}x\d{3}", adf_item):
-                adf_dict["DrawArea"] = m.group(0)
-            else:
-                other_items.append(adf_item)
-
-    if not "TargetDevice" in adf_dict:
-        adf_dict["TargetDevice"] = device_name
-
-    if not "DrawArea" in adf_dict:
-        adf_dict["DrawArea"] = draw_area
+    len_dict_first = {}
+    for off, key in key_map_first.items():
+        len_dict_first[key] = adf_data[off]
+        
+    len_dict_second = {}
+    for off, key in key_map_second.items():
+        len_dict_second[key] = adf_data[off]
+        
+    if DEBUG:
+        offs = list(key_map_sys.keys()) + list(key_map_first.keys()) + list(key_map_second.keys())
+        for i in range(0, 0x74):
+            if i not in offs and adf_data[i] != 0:
+                print(f"!!! unknown length offset {hex(i)}, value {hex(adf_data[i])}!!!")
+    
+    off = start_adf
+    if DEBUG:
+        print("len_dict_first:", len_dict_first)
+    for key, len in len_dict_first.items():
+        if len > 1:
+            item_data = adf_data[off : off + len]
+            if DEBUG:
+                print(f"[{key}] start: {hex(off)}, size: {hex(len)}. {adf_data[off : off + len]}")
+                if item_data[-1] != 0:
+                    print("The last element is not 0:", hex(off))
+            adf_dict[key] = item_data[:-1].decode("cp932")
+            off += len
+    
+    other_items = [b.decode("cp932") for b in adf_data[off : ].split(b"\x00") if any(b)]
+    
+    # Padding
+    off += 0x20
+    
+    jam_download_url = adf_dict["jam_download_url"]
+    del adf_dict["jam_download_url"]
 
     return (adf_dict, jam_download_url, other_items)
 
@@ -305,9 +402,9 @@ def format_last_modified(last_modified_dt):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser("N504i type ADF converter for idkdoja")
+    parser = argparse.ArgumentParser("NEC mova's JAVA converter for idkdoja")
     parser.add_argument("input")
-    parser.add_argument("model", choices=CONFIGS.keys())
+    parser.add_argument("model", choices=CONFIGS.keys(), help="input model")
     parser.add_argument("-o", "--output", default=None)
     args = parser.parse_args()
 
