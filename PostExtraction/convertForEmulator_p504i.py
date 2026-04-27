@@ -8,11 +8,12 @@ import fnmatch
 import email.utils
 import traceback
 
+DEBUG = False
 
 def main():
     java_directory = sys.argv[1]
 
-    output_folder = os.path.join(os.getcwd(), "output")
+    output_folder = os.path.dirname(os.path.abspath(java_directory)) + "\\output\\"
     os.makedirs(output_folder, exist_ok=True)
     
     adf_dir = os.path.join(java_directory, "JAM")
@@ -105,7 +106,7 @@ def convert(adf_content, jar_content, sp_content):
     adf_dict = {}
 
     if adf_content[0x3A5:0x3A5+5] == b"http:":
-        print("P504i ADF type")
+        print("P504i/P504iS ADF type")
         adf_dict["AppName"] = carve_value(adf_content, 0).decode("cp932")
         
         if v := carve_value(adf_content, 0x11):
@@ -114,8 +115,8 @@ def convert(adf_content, jar_content, sp_content):
         sp_sizes = [int.from_bytes(adf_content[0x20:0x24], "little")]
         adf_dict["AppClass"] = carve_value(adf_content, 0x24).decode("cp932")
         
-        #if v := carve_value(adf_content, 0x???):
-        #    adf_dict["AppParam"] = v.decode("cp932")
+        if v := carve_value(adf_content, 0x124):
+            adf_dict["AppParam"] = v.decode("cp932")
         
         adf_dict["PackageURL"] = carve_value(adf_content, 0x3A5).decode("cp932")
         
@@ -132,8 +133,10 @@ def convert(adf_content, jar_content, sp_content):
         if v := carve_value(adf_content, 0x7E6):
             adf_dict["TargetDevice"] = v.decode("cp932")
         
+        adf_dict["DrawArea"] = "132x144"
+        
     elif adf_content[0x3E5:0x3E5+5] == b"http:":
-        print("P505i ADF type")
+        print("P505i/P506iC ADF type")
         adf_dict["AppName"] = carve_value(adf_content, 0).decode("cp932")
         
         if v := carve_value(adf_content, 0x11):
@@ -159,13 +162,63 @@ def convert(adf_content, jar_content, sp_content):
         
         if v := carve_value(adf_content, 0x826):
             adf_dict["TargetDevice"] = v.decode("cp932")
+            
+        adf_dict["DrawArea"] = "240x266"
+    elif adf_content[0x65C:0x65C+5] == b"http:":
+        print("F504iS ADF type")
+        adf_dict["AppName"] = carve_value(adf_content, 0xA).decode("cp932")
+        
+        if v := carve_value(adf_content, 0x29):
+            adf_dict["AppVer"] = v.decode("cp932")
+        
+        sp_sizes = [int.from_bytes(adf_content[0x4:0x8], "big")]
+        adf_dict["AppClass"] = carve_value(adf_content, 0x14C).decode("cp932")
+        
+        if v := carve_value(adf_content, 0x14C):
+            adf_dict["AppParam"] = v.decode("cp932")
+        
+        adf_dict["PackageURL"] = carve_value(adf_content, 0x65C).decode("cp932")
+        
+        if adf_content[0x13B:0x13B+4] == b"CLDC":
+            adf_dict["ConfigurationVer"] = adf_content[0x13B:0x143].decode("cp932")
+        
+        adf_dict["LastModified"] = carve_value(adf_content, 0x34B).decode("cp932")
+        adf_dict["LastModified"] = email.utils.parsedate_to_datetime(adf_dict["LastModified"])
+        adf_dict["LastModified"] = format_last_modified(adf_dict["LastModified"])
+        
+        if adf_content[0x143:0x143+4] == b"DoJa":
+            adf_dict["ProfileVer"] = adf_content[0x13B:0x143].decode("cp932")
+        
+        if v := carve_value(adf_content, 0x390):
+            adf_dict["TargetDevice"] = v.decode("cp932")
+        
+        adf_dict["DrawArea"] = "132x176"
     else:
         raise ValueError("Unknown ADF type")
     
     if not all([adf_dict["AppName"], adf_dict["AppClass"], adf_dict["LastModified"]]):
         raise ValueError("AppName or AppClass or LastModified is missing")
-        
+    
     print(adf_dict)
+    
+    # Extract the unparsed portions.
+    rest = []
+    for raw in adf_content.split(b"\00"):
+        if raw == b"":
+            continue
+        
+        try:
+            value = raw.decode("ascii")
+        except:
+            continue
+        
+        if value in adf_dict.values():
+            continue
+        
+        rest.append(value)
+    
+    if DEBUG:
+        print("rest:", rest)
     
     # create a jam
     jam_str = ""
@@ -220,6 +273,7 @@ def add_header_to_sp(jam_str, sp_contents):
 
     return header + sp_contents
 
+
 def format_last_modified(last_modified_dt):
     weekdays = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
     months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
@@ -230,8 +284,10 @@ def format_last_modified(last_modified_dt):
     last_modified_str = last_modified_dt.strftime(f"{weekday_name}, %d {month_name} %Y %H:%M:%S")
     return last_modified_str
 
+
 if __name__ == "__main__":
     if len(sys.argv) != 2:
         print(f"Usage: python {sys.argv[0]} java_directory")
     else:
         main()
+
