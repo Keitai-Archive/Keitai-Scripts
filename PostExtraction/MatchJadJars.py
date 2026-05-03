@@ -1,227 +1,157 @@
 import argparse
-import os
-import re
 import zipfile
 from pathlib import Path
 from urllib.parse import urlparse, unquote
 
 
-TEXT_ENCODINGS = ("cp932", "shift_jis", "utf-8-sig", "utf-8", "latin-1")
+MATCH_FIELDS = [
+    "MIDlet-Name",
+    "MIDlet-Vendor",
+    "MIDlet-Version",
+    "MIDlet-Icon",
+    "MIDlet-Data-Size",
+]
 
 
-def decode_text(data: bytes) -> str:
-    for enc in TEXT_ENCODINGS:
-        try:
-            return data.decode(enc)
-        except UnicodeDecodeError:
-            pass
-    return data.decode("latin-1", errors="replace")
-
-
-def parse_properties(text: str) -> dict:
+def parse_props(text: str) -> dict:
     props = {}
-    current_key = None
 
-    for raw_line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
-        line = raw_line.strip()
-
-        if not line or line.startswith("#"):
+    for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        line = line.strip()
+        if not line or ":" not in line:
             continue
 
-        # Manifest continuation line
-        if raw_line.startswith(" ") and current_key:
-            props[current_key] += raw_line[1:].strip()
-            continue
-
-        if ":" in line:
-            key, value = line.split(":", 1)
-        elif "=" in line:
-            key, value = line.split("=", 1)
-        else:
-            continue
-
-        key = key.strip()
-        value = value.strip()
-        props[key] = value
-        current_key = key
+        key, value = line.split(":", 1)
+        props[key.strip()] = value.strip()
 
     return props
 
 
 def read_jad(path: Path) -> dict:
-    return parse_properties(decode_text(path.read_bytes()))
+    return parse_props(path.read_text("utf-8"))
 
 
-def read_manifest_from_jar(path: Path) -> dict:
-    try:
-        with zipfile.ZipFile(path, "r") as z:
-            for name in z.namelist():
-                if name.upper() == "META-INF/MANIFEST.MF":
-                    return parse_properties(decode_text(z.read(name)))
-    except zipfile.BadZipFile:
-        pass
-
+def read_manifest(path: Path) -> dict:
+    with zipfile.ZipFile(path, "r") as z:
+        for name in z.namelist():
+            if name.upper() == "META-INF/MANIFEST.MF":
+                return parse_props(z.read(name).decode("utf-8"))
     return {}
 
 
-def get_jar_url_filename(jad_props: dict) -> str:
+def jar_name_from_jad(jad_props: dict) -> str | None:
     url = jad_props.get("MIDlet-Jar-URL", "").strip()
     if not url:
-        return ""
+        return None
 
     parsed = urlparse(url)
-    filename = os.path.basename(parsed.path)
+    name = Path(unquote(parsed.path)).name
 
-    return unquote(filename)
-
-
-def normalize(value: str) -> str:
-    return value.strip().lower()
+    return name if name.lower().endswith(".jar") else None
 
 
-def score_match(jad_path: Path, jad_props: dict, jar_path: Path, manifest_props: dict) -> tuple[int, list[str]]:
+def score_match(jad: Path, jad_props: dict, jar: Path, manifest: dict) -> int:
     score = 0
-    reasons = []
 
-    expected_jar_name = get_jar_url_filename(jad_props)
+    expected_name = jar_name_from_jad(jad_props)
 
-    if expected_jar_name and normalize(jar_path.name) == normalize(expected_jar_name):
-        score += 50
-        reasons.append(f"JAR filename matches MIDlet-Jar-URL: {expected_jar_name}")
+    if expected_name and jar.name.lower() == expected_name.lower():
+        score += 100
 
     jad_size = jad_props.get("MIDlet-Jar-Size")
-    if jad_size and jad_size.isdigit():
-        actual_size = jar_path.stat().st_size
-        if int(jad_size) == actual_size:
-            score += 40
-            reasons.append(f"JAR size matches MIDlet-Jar-Size: {actual_size}")
+    if jad_size and jad_size.isdigit() and int(jad_size) == jar.stat().st_size:
+        score += 75
 
-    compare_fields = [
-        "MIDlet-Name",
-        "MIDlet-Vendor",
-        "MIDlet-Version",
-        "MIDlet-Description",
-        "MIDlet-Icon",
-        "MIDlet-1",
-        "MIDlet-OCL",
-    ]
+    for field in MATCH_FIELDS:
+        if jad_props.get(field) and manifest.get(field):
+            if jad_props[field].strip() == manifest[field].strip():
+                score += 25
 
-    for field in compare_fields:
-        jad_value = jad_props.get(field)
-        manifest_value = manifest_props.get(field)
-
-        if jad_value and manifest_value and normalize(jad_value) == normalize(manifest_value):
-            score += 20
-            reasons.append(f"{field} matches")
-
-    return score, reasons
-
-
-def sanitize_filename(name: str) -> str:
-    name = name.strip()
-    name = re.sub(r'[<>:"/\\|?*\x00-\x1F]', "_", name)
-    name = re.sub(r"\s+", " ", name)
-    name = name.rstrip(". ")
-
-    return name or "Unknown MIDlet"
+    return score
 
 
 def unique_path(path: Path) -> Path:
     if not path.exists():
         return path
 
-    stem = path.stem
-    suffix = path.suffix
-    parent = path.parent
-
-    counter = 2
+    i = 2
     while True:
-        candidate = parent / f"{stem}_{counter}{suffix}"
-        if not candidate.exists():
-            return candidate
-        counter += 1
+        new_path = path.with_name(f"{path.stem}_{i}{path.suffix}")
+        if not new_path.exists():
+            return new_path
+        i += 1
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Match .JAD files to .JAR files using MIDlet-Jar-URL and JAR manifests, then rename both."
-    )
-    parser.add_argument("folder", help="Folder containing .jad and .jar files")
-    parser.add_argument("--recursive", action="store_true", help="Scan folders recursively")
-    parser.add_argument("--apply", action="store_true", help="Actually rename files. Default is dry-run.")
-    parser.add_argument("--min-score", type=int, default=60, help="Minimum score required to rename a pair")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("folder")
+    parser.add_argument("--apply", action="store_true")
+    parser.add_argument("--min-score", type=int, default=75)
     args = parser.parse_args()
 
-    root = Path(args.folder)
+    folder = Path(args.folder)
 
-    if not root.exists():
-        print(f"Folder does not exist: {root}")
-        return
-
-    pattern = "**/*" if args.recursive else "*"
-
-    jad_files = sorted(p for p in root.glob(pattern) if p.is_file() and p.suffix.lower() == ".jad")
-    jar_files = sorted(p for p in root.glob(pattern) if p.is_file() and p.suffix.lower() == ".jar")
+    jad_files = list(folder.glob("*.jad"))
+    jar_files = list(folder.glob("*.jar"))
 
     jar_manifests = {}
     for jar in jar_files:
-        jar_manifests[jar] = read_manifest_from_jar(jar)
+        try:
+            jar_manifests[jar] = read_manifest(jar)
+        except Exception as ex:
+            print(f"Skipping bad JAR: {jar.name} - {ex}")
 
     used_jars = set()
 
-    print(f"Found {len(jad_files)} JAD file(s)")
-    print(f"Found {len(jar_files)} JAR file(s)")
-    print("Mode:", "APPLY" if args.apply else "DRY-RUN")
-    print()
-
     for jad in jad_files:
-        jad_props = read_jad(jad)
+        try:
+            jad_props = read_jad(jad)
+        except Exception as ex:
+            print(f"Skipping bad JAD: {jad.name} - {ex}")
+            continue
+
+        wanted_jar_name = jar_name_from_jad(jad_props)
+
+        if not wanted_jar_name:
+            print(f"No MIDlet-Jar-URL filename found in {jad.name}")
+            continue
 
         best_jar = None
         best_score = -1
-        best_reasons = []
 
-        for jar in jar_files:
+        for jar, manifest in jar_manifests.items():
             if jar in used_jars:
                 continue
 
-            manifest = jar_manifests.get(jar, {})
-            score, reasons = score_match(jad, jad_props, jar, manifest)
+            score = score_match(jad, jad_props, jar, manifest)
 
             if score > best_score:
                 best_score = score
                 best_jar = jar
-                best_reasons = reasons
 
-        midlet_name = jad_props.get("MIDlet-Name") or jad_props.get("MIDlet-1", "").split(",")[0]
-        safe_name = sanitize_filename(midlet_name)
-
-        print(f"JAD: {jad.name}")
+        print(f"\nJAD: {jad.name}")
+        print(f"Expected output name: {wanted_jar_name}")
+        print(f"Best JAR: {best_jar.name if best_jar else 'None'}")
+        print(f"Score: {best_score}")
 
         if not best_jar or best_score < args.min_score:
-            print(f"  No confident match found. Best score: {best_score}")
-            print()
+            print("No confident match found.")
             continue
 
         used_jars.add(best_jar)
 
-        new_jad = unique_path(jad.with_name(f"{safe_name}.jad"))
-        new_jar = unique_path(best_jar.with_name(f"{safe_name}.jar"))
+        base_name = Path(wanted_jar_name).stem
 
-        print(f"  Matched JAR: {best_jar.name}")
-        print(f"  Score: {best_score}")
-        for reason in best_reasons:
-            print(f"   - {reason}")
+        new_jad = unique_path(jad.with_name(base_name + ".jad"))
+        new_jar = unique_path(best_jar.with_name(base_name + ".jar"))
 
-        print(f"  Rename JAD: {jad.name} -> {new_jad.name}")
-        print(f"  Rename JAR: {best_jar.name} -> {new_jar.name}")
+        print(f"Rename JAD: {jad.name} -> {new_jad.name}")
+        print(f"Rename JAR: {best_jar.name} -> {new_jar.name}")
 
         if args.apply:
             jad.rename(new_jad)
             best_jar.rename(new_jar)
-            print("  Renamed.")
-
-        print()
+            print("Renamed.")
 
 
 if __name__ == "__main__":
